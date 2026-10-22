@@ -1,0 +1,22 @@
+import express from 'express';
+import http from 'http';
+import {Server} from 'socket.io';
+import crypto from 'crypto';
+const app=express(), server=http.createServer(app),io=new Server(server);app.use(express.static('public'));
+const rooms=new Map();const tiles=()=>Array.from({length:7},(_,a)=>Array.from({length:7-a},(_,b)=>[a,a+b])).flat();
+function publicState(r,sid){return {code:r.code,host:r.host,phase:r.phase,players:r.players.map(p=>({id:p.id,name:p.name,count:p.hand.length,score:p.score,connected:p.connected})),board:r.board,stock:r.stock.length,turn:r.players[r.turn]?.id||null,me:r.players.find(p=>p.id===sid)?.hand||[],winner:r.winner||null,ends:r.ends};}
+function emit(r){for(const p of r.players)if(p.connected)io.to(p.id).emit('state',publicState(r,p.id));}
+function err(socket,message){socket.emit('errorMsg',message)}
+function start(r){let deck=tiles();for(let i=deck.length-1;i>0;i--){let j=crypto.randomInt(i+1);[deck[i],deck[j]]=[deck[j],deck[i]];}r.players.forEach(p=>p.hand=deck.splice(0,7));r.stock=deck;r.board=[];r.ends=null;r.turn=0;r.phase='playing';r.winner=null;r.passes=0;}
+function finish(r,winner){r.phase='finished';r.winner=winner?.name||'تعادل';if(winner){winner.score+=r.players.filter(p=>p!==winner).reduce((sum,p)=>sum+p.hand.reduce((s,t)=>s+t[0]+t[1],0),0);}emit(r)}
+function next(r){r.turn=(r.turn+1)%r.players.length;emit(r)}
+io.on('connection',socket=>{
+ socket.on('create',({name},cb)=>{name=String(name||'').trim().slice(0,18);if(!name)return cb({error:'اكتب اسمك'});let code;do{code=crypto.randomBytes(3).toString('hex').toUpperCase()}while(rooms.has(code));let r={code,host:socket.id,players:[{id:socket.id,name,hand:[],score:0,connected:true}],phase:'lobby',board:[],stock:[],turn:0};rooms.set(code,r);socket.join(code);socket.data.code=code;cb({code});emit(r)});
+ socket.on('join',({code,name},cb)=>{code=String(code||'').toUpperCase().trim();name=String(name||'').trim().slice(0,18);let r=rooms.get(code);if(!r)return cb({error:'الغرفة غير موجودة'});if(r.phase!=='lobby')return cb({error:'المباراة بدأت بالفعل'});if(r.players.length>=4)return cb({error:'الغرفة ممتلئة'});if(!name)return cb({error:'اكتب اسمك'});r.players.push({id:socket.id,name,hand:[],score:0,connected:true});socket.join(code);socket.data.code=code;cb({code});emit(r)});
+ socket.on('start',()=>{let r=rooms.get(socket.data.code);if(!r||r.host!==socket.id||r.phase==='playing')return;if(r.players.length<2)return err(socket,'لازم لاعبين على الأقل');start(r);emit(r)});
+ socket.on('play',({index,side})=>{let r=rooms.get(socket.data.code);if(!r||r.phase!=='playing')return;let p=r.players[r.turn];if(p.id!==socket.id)return err(socket,'مش دورك');if(!Number.isInteger(index)||index<0||index>=p.hand.length||!['left','right'].includes(side))return;let t=p.hand[index],v=[...t];if(r.ends){let end=side==='left'?r.ends[0]:r.ends[1];if(side==='left'){if(v[1]!==end){if(v[0]===end)v.reverse();else return err(socket,'القطعة مش مناسبة للطرف ده')}}else{if(v[0]!==end){if(v[1]===end)v.reverse();else return err(socket,'القطعة مش مناسبة للطرف ده')}}}p.hand.splice(index,1);if(side==='left')r.board.unshift(v);else r.board.push(v);r.ends=[r.board[0][0],r.board[r.board.length-1][1]];r.passes=0;if(!p.hand.length)return finish(r,p);next(r)});
+ socket.on('draw',()=>{let r=rooms.get(socket.data.code);if(!r||r.phase!=='playing'||r.players[r.turn].id!==socket.id)return;let p=r.players[r.turn];if(p.hand.some(t=>!r.ends||t.includes(r.ends[0])||t.includes(r.ends[1])))return err(socket,'عندك قطعة ممكن تلعبها');if(!r.stock.length)return err(socket,'السوق خلص');p.hand.push(r.stock.pop());emit(r)});
+ socket.on('pass',()=>{let r=rooms.get(socket.data.code);if(!r||r.phase!=='playing'||r.players[r.turn].id!==socket.id)return;let p=r.players[r.turn];if(r.stock.length||p.hand.some(t=>!r.ends||t.includes(r.ends[0])||t.includes(r.ends[1])))return err(socket,'لازم تلعب أو تسحب من السوق');r.passes++;if(r.passes>=r.players.length){let sorted=[...r.players].sort((a,b)=>a.hand.reduce((s,t)=>s+t[0]+t[1],0)-b.hand.reduce((s,t)=>s+t[0]+t[1],0));return finish(r,sorted[0])}next(r)});
+ socket.on('disconnect',()=>{let r=rooms.get(socket.data.code);if(!r)return;let ix=r.players.findIndex(p=>p.id===socket.id);if(ix<0)return;r.players.splice(ix,1);if(!r.players.length){rooms.delete(r.code);return}if(r.host===socket.id)r.host=r.players[0].id;if(r.phase==='playing'){r.phase='lobby';r.board=[];r.players.forEach(p=>p.hand=[]);r.turn=0;}emit(r)});
+});
+server.listen(process.env.PORT||3000,()=>console.log('Domino Friends ready'));
